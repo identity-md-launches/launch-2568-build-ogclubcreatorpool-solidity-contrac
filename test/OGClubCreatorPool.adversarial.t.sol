@@ -645,11 +645,19 @@ contract OGClubCreatorPoolAdversarialTest is Test {
         pool.changePayout(G1, next);
     }
 
-    function test_monthsAlreadyProposedStillPayAndSweepWithoutAnOwner() public {
+    function test_renounceIsRefused_andMonthsStillPayAfterAHandover() public {
         bytes32[] memory l = _propose3(M1);
         vm.prank(owner);
+        vm.expectRevert(OGClubCreatorPool.RenounceDisabled.selector);
         pool.renounceOwnership();
-        assertEq(pool.owner(), address(0));
+        assertEq(pool.owner(), owner);
+        // A two-step handover does not disturb a month already proposed.
+        address next = makeAddr("next-owner");
+        vm.prank(owner);
+        pool.transferOwnership(next);
+        vm.prank(next);
+        pool.acceptOwnership();
+        assertEq(pool.owner(), next);
         skip(3 days);
         vm.prank(relayer);
         pool.claim(M1, G2, 200 ether, Merkle.proof(l, 1));

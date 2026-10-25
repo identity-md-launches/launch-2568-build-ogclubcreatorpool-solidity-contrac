@@ -181,12 +181,14 @@ contract ActorsHandler is Test {
         (, uint256 remaining, uint256 opensAt, bool cancelled,) = _m(month);
         bool shouldWork = !cancelled && block.timestamp < opensAt;
         uint256 reservedBefore = pool.reserved();
+        uint256 lastBefore = pool.lastMonth();
         vm.prank(owner);
         try pool.cancelMonth(month) {
             if (!shouldWork) _flag("cancel of opened or cancelled month accepted");
             if (pool.reserved() != reservedBefore - remaining) _flag("cancel released wrong amount");
             ++okCancels;
-            if (month == pool.lastMonth()) nextMonth = month;
+            // Cancelling the highest month walks lastMonth back, so the same id is proposed again.
+            if (month == lastBefore) nextMonth = month;
         } catch {
             if (shouldWork) _flag("cancel of pending month refused");
         }
@@ -401,19 +403,22 @@ contract OGClubCreatorPoolActorsInvariantTest is Test {
     /// forge-config: default.invariant.depth = 120
     function invariant_reservedIsSumOfOpenMonthsRemaining_andMonthsNeverOverpay() public view {
         uint256 sum;
+        uint256 highestLive;
         uint256 n = handler.monthsCount();
         for (uint256 i; i < n; ++i) {
             uint256 month = handler.proposedMonths(i);
             (, uint256 total, uint256 remaining,, bool cancelled, bool swept) = pool.months(month);
+            if (!cancelled && month > highestLive) highestLive = month;
             uint256 paid = handler.paidOf(month);
             assertLe(paid, total, "month paid more than its total");
             if (cancelled || swept) assertEq(remaining, 0, "closed-out month still holds a reservation");
             else assertEq(remaining, total - paid, "remaining != total - paid");
             assertTrue(pool.isValidMonth(month));
-            assertLe(month, pool.lastMonth());
+            if (!cancelled) assertLe(month, pool.lastMonth());
             sum += remaining;
         }
         assertEq(pool.reserved(), sum);
+        assertEq(pool.lastMonth(), highestLive, "lastMonth is not the highest live month");
     }
 
     /// forge-config: default.invariant.runs = 128
