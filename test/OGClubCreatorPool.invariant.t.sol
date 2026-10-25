@@ -103,8 +103,21 @@ contract PoolHandler is Test {
         if (cancelled || block.timestamp >= opensAt) return;
         vm.prank(owner);
         pool.cancelMonth(month);
-        // A cancelled last month may be proposed again under the same id.
-        if (month == pool.lastMonth()) nextMonth = month;
+        // Cancelling the highest month moves lastMonth back, so its id is free to use again.
+        if (pool.lastMonth() < month) nextMonth = month;
+    }
+
+    function tryOwnerAsPayout(uint8 gameRaw, bool viaList) external {
+        // The contract must refuse the owner as a payout wallet on both paths; this call reverting
+        // is the expected outcome, and fail_on_revert is off so the run continues either way.
+        uint256 g = bound(gameRaw, 0, GAMES - 1);
+        if (viaList) {
+            vm.prank(owner);
+            pool.listGame(keccak256(abi.encode("owner-game", gameRaw)), owner);
+        } else {
+            vm.prank(payouts[g]);
+            pool.changePayout(gameIds[g], owner);
+        }
     }
 
     function claim(uint256 idx, uint8 gameRaw, bool asOwner) external {
@@ -185,6 +198,25 @@ contract OGClubCreatorPoolInvariantTest is Test {
 
     function invariant_ownerNeverGainsOG() public view {
         assertEq(og.balanceOf(owner), 0);
+    }
+
+    function invariant_ownerIsNeverAPayout() public view {
+        for (uint256 i; i < 6; ++i) {
+            (address payout,) = pool.games(handler.gameIds(i));
+            assertTrue(payout != owner, "owner listed as payout");
+        }
+    }
+
+    /// @dev lastMonth is the highest proposed month that is not cancelled, or 0.
+    function invariant_lastMonthIsHighestLiveMonth() public view {
+        uint256 highest;
+        uint256 n = handler.monthsCount();
+        for (uint256 i; i < n; ++i) {
+            uint256 month = handler.proposedMonths(i);
+            (,,,, bool cancelled,) = pool.months(month);
+            if (!cancelled && month > highest) highest = month;
+        }
+        assertEq(pool.lastMonth(), highest);
     }
 
     function invariant_conservation() public view {

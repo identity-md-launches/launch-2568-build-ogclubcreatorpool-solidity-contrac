@@ -176,6 +176,8 @@ contract OGClubCreatorPoolTest is Test {
         (address payout, bool listed) = pool.games(G1);
         assertEq(payout, dev1);
         assertTrue(listed);
+        assertEq(pool.listedAt(G1), START);
+        assertEq(pool.listedAt(pool.gameId("ghost")), 0);
     }
 
     function test_listGame_emits() public {
@@ -364,7 +366,18 @@ contract OGClubCreatorPoolTest is Test {
 
     function test_feeOnTransfer_claimReverts() public {
         // A token that debits the sender more than the amount: the pool's exact send check catches it.
-        FeeOnTransferToken fee = new FeeOnTransferToken(true);
+        _feeClaimReverts(true, 101 ether);
+    }
+
+    function test_feeOnTransfer_claimReverts_recipientCharged() public {
+        // The usual shape: the recipient gets less than sent. The pool's own balance drops by exactly
+        // the amount, so only the recipient-side check catches it; the game is never credited for
+        // tokens it did not receive.
+        _feeClaimReverts(false, 99 ether);
+    }
+
+    function _feeClaimReverts(bool chargeSender, uint256 observed) internal {
+        FeeOnTransferToken fee = new FeeOnTransferToken(chargeSender);
         OGClubCreatorPool feePool = new OGClubCreatorPool(IERC20(address(fee)), owner);
         vm.prank(owner);
         feePool.listGame(G1, dev1);
@@ -378,11 +391,12 @@ contract OGClubCreatorPoolTest is Test {
         skip(3 days);
 
         bytes32[] memory proof = Merkle.proof(leaves, 0);
-        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.BalanceMismatch.selector, 100 ether, 101 ether));
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.BalanceMismatch.selector, 100 ether, observed));
         feePool.claim(M1, G1, 100 ether, proof);
         // The revert rolled everything back.
         assertEq(feePool.reserved(), 100 ether);
         assertFalse(feePool.claimed(M1, G1));
+        assertEq(fee.balanceOf(dev1), 0);
     }
 
     // ────────────────────────────────────────────────────────────────────────────── months ──
@@ -762,16 +776,188 @@ contract OGClubCreatorPoolTest is Test {
         pool.cancelMonth(M2);
     }
 
-    function test_cancelledMonthIsNotLastMonthBarrierForOlderMonths() public {
-        // lastMonth still moves forward: cancelling M2 does not let M1 be proposed.
+    function test_cancelMonth_restoresLastMonthAfterTypo() public {
+        // A mistyped far-future id is undone by cancelling it: lastMonth goes back to what it was.
         _fund(10 ether);
         vm.startPrank(owner);
+        pool.proposeMonth(999_912, bytes32(uint256(1)), 1 ether);
+        assertEq(pool.lastMonth(), 999_912);
+        assertEq(pool.lastMonthBefore(999_912), 0);
+        pool.cancelMonth(999_912);
+        assertEq(pool.lastMonth(), 0, "restored");
+        assertEq(pool.free(), 10 ether);
+        pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
+        assertEq(pool.lastMonth(), M1);
+
+        // Same with a live month below: M3 typed for M2, cancelled, M2 goes through.
+        pool.proposeMonth(M3, bytes32(uint256(1)), 1 ether);
+        assertEq(pool.lastMonthBefore(M3), M1);
+        pool.cancelMonth(M3);
+        assertEq(pool.lastMonth(), M1);
         pool.proposeMonth(M2, bytes32(uint256(1)), 1 ether);
-        pool.cancelMonth(M2);
+        assertEq(pool.lastMonth(), M2);
+        // The cancelled M3 can still be proposed later, overwriting the cancelled record.
+        pool.proposeMonth(M3, bytes32(uint256(2)), 1 ether);
+        assertEq(pool.lastMonthBefore(M3), M2);
+        (bytes32 root,,,, bool cancelled,) = pool.months(M3);
+        assertEq(root, bytes32(uint256(2)));
+        assertFalse(cancelled);
+        vm.stopPrank();
+    }
+
+    function test_cancelMonth_onlyLastMonthMovesLastMonth() public {
+        // Cancelling a month below the last one leaves lastMonth alone: live later months stay the bar.
+        _fund(10 ether);
+        vm.startPrank(owner);
+        pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
+        pool.proposeMonth(M2, bytes32(uint256(1)), 1 ether);
+        pool.cancelMonth(M1);
+        assertEq(pool.lastMonth(), M2);
         vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.MonthNotAfterLast.selector, M1, M2));
         pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
-        pool.proposeMonth(M3, bytes32(uint256(1)), 1 ether);
         vm.stopPrank();
+    }
+
+    function test_cancelMonth_walksBackOverCancelledMonths() public {
+        // M1 live, M2 and M3 proposed, M2 cancelled while M3 live, then M3 cancelled: lastMonth
+        // skips the cancelled M2 and lands on M1, so M2 can be proposed again as a normal month.
+        _fund(10 ether);
+        vm.startPrank(owner);
+        pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
+        pool.proposeMonth(M2, bytes32(uint256(1)), 1 ether);
+        pool.proposeMonth(M3, bytes32(uint256(1)), 1 ether);
+        pool.cancelMonth(M2);
+        assertEq(pool.lastMonth(), M3);
+        pool.cancelMonth(M3);
+        assertEq(pool.lastMonth(), M1);
+        assertEq(pool.reserved(), 1 ether);
+        pool.proposeMonth(M2, bytes32(uint256(3)), 2 ether);
+        assertEq(pool.lastMonth(), M2);
+        assertEq(pool.lastMonthBefore(M2), M1);
+        assertEq(pool.reserved(), 3 ether);
+        vm.stopPrank();
+    }
+
+    function test_cancelMonth_lastMonthNeverDropsBelowOpenMonth() public {
+        // Once M1 is open it is permanent, and no cancel sequence lets an id <= M1 be proposed.
+        _fund(10 ether);
+        vm.startPrank(owner);
+        pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
+        skip(3 days);
+        pool.proposeMonth(M3, bytes32(uint256(1)), 1 ether);
+        pool.cancelMonth(M3);
+        assertEq(pool.lastMonth(), M1);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.MonthNotAfterLast.selector, M1, M1));
+        pool.proposeMonth(M1, bytes32(uint256(1)), 1 ether);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.MonthNotAfterLast.selector, 202_612, M1));
+        pool.proposeMonth(202_612, bytes32(uint256(1)), 1 ether);
+        vm.stopPrank();
+    }
+
+    // ─────────────────────────────────────────────────────────── recipients fixed at proposal ──
+
+    function test_claim_revertsForGameListedAfterProposal() public {
+        // A leaf for an id that is not listed when the month is proposed stays unclaimable even if
+        // the owner lists that id afterwards: the owner cannot pick the recipient once the month
+        // is out of its reach.
+        bytes32 newGame = pool.gameId("new-game");
+        address late = makeAddr("late-wallet");
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = pool.leaf(M1, newGame, 100 ether);
+        _fund(100 ether);
+        vm.prank(owner);
+        pool.proposeMonth(M1, Merkle.root(leaves), 100 ether);
+        skip(3 days);
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.MonthAlreadyOpen.selector, M1, uint64(START + 3 days)));
+        pool.cancelMonth(M1);
+
+        vm.prank(owner);
+        pool.listGame(newGame, late);
+        assertEq(pool.listedAt(newGame), START + 3 days);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.GameListedAfterProposal.selector, newGame, M1));
+        pool.claim(M1, newGame, 100 ether, new bytes32[](0));
+        assertEq(og.balanceOf(late), 0);
+
+        // Listing one second after the proposal is also too late.
+        bytes32 other = pool.gameId("other-game");
+        bytes32[] memory l2 = new bytes32[](1);
+        l2[0] = pool.leaf(M2, other, 1 ether);
+        _fund(1 ether);
+        vm.prank(owner);
+        pool.proposeMonth(M2, Merkle.root(l2), 1 ether);
+        skip(1);
+        vm.prank(owner);
+        pool.listGame(other, late);
+        skip(3 days);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.GameListedAfterProposal.selector, other, M2));
+        pool.claim(M2, other, 1 ether, new bytes32[](0));
+
+        // The money stays owed to the month and is swept back to free(), never to the owner.
+        skip(90 days);
+        pool.sweep(M1);
+        pool.sweep(M2);
+        assertEq(pool.free(), 101 ether);
+        assertEq(og.balanceOf(owner), 0);
+    }
+
+    function test_claim_gameListedInProposalBlockCanClaim() public {
+        // Listed in the same block as the proposal: known when the review starts, so allowed.
+        bytes32 newGame = pool.gameId("new-game");
+        address wallet = makeAddr("new-wallet");
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = pool.leaf(M1, newGame, 5 ether);
+        _fund(5 ether);
+        vm.startPrank(owner);
+        pool.proposeMonth(M1, Merkle.root(leaves), 5 ether);
+        pool.listGame(newGame, wallet);
+        vm.stopPrank();
+        skip(3 days);
+        pool.claim(M1, newGame, 5 ether, new bytes32[](0));
+        assertEq(og.balanceOf(wallet), 5 ether);
+    }
+
+    function test_claim_lateListedGameIsPaidByTheNextMonth() public {
+        bytes32 newGame = pool.gameId("new-game");
+        address wallet = makeAddr("new-wallet");
+        (bytes32[] memory g, uint256[] memory a) = _three();
+        _propose(M1, g, a);
+        skip(1 days);
+        vm.prank(owner);
+        pool.listGame(newGame, wallet);
+
+        // Next month includes the new game; it is paid like any other.
+        bytes32[] memory g2 = new bytes32[](2);
+        uint256[] memory a2 = new uint256[](2);
+        g2[0] = G1;
+        g2[1] = newGame;
+        a2[0] = 1 ether;
+        a2[1] = 2 ether;
+        bytes32[] memory l2 = _propose(M2, g2, a2);
+        skip(3 days);
+        pool.claim(M2, newGame, 2 ether, Merkle.proof(l2, 1));
+        assertEq(og.balanceOf(wallet), 2 ether);
+    }
+
+    function test_claim_reproposedMonthAcceptsGamesListedBeforeTheReproposal() public {
+        // Cancel and re-propose restarts the review, so a game listed in between is fine.
+        bytes32 newGame = pool.gameId("new-game");
+        address wallet = makeAddr("new-wallet");
+        bytes32[] memory leaves = new bytes32[](1);
+        leaves[0] = pool.leaf(M1, newGame, 5 ether);
+        _fund(5 ether);
+        vm.startPrank(owner);
+        pool.proposeMonth(M1, Merkle.root(leaves), 5 ether);
+        skip(1 days);
+        pool.listGame(newGame, wallet);
+        pool.cancelMonth(M1);
+        skip(1);
+        pool.proposeMonth(M1, Merkle.root(leaves), 5 ether);
+        vm.stopPrank();
+        skip(3 days);
+        pool.claim(M1, newGame, 5 ether, new bytes32[](0));
+        assertEq(og.balanceOf(wallet), 5 ether);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────── sweep ──
@@ -839,6 +1025,58 @@ contract OGClubCreatorPoolTest is Test {
     }
 
     // ────────────────────────────────────────────────────────────────────── owner cannot ──
+
+    function test_renounceOwnershipDisabled() public {
+        vm.prank(owner);
+        vm.expectRevert(OGClubCreatorPool.RenounceDisabled.selector);
+        pool.renounceOwnership();
+        assertEq(pool.owner(), owner);
+        vm.prank(stranger);
+        vm.expectRevert(OGClubCreatorPool.RenounceDisabled.selector);
+        pool.renounceOwnership();
+    }
+
+    function test_ownerCannotBeAPayoutWallet() public {
+        bytes32 id = pool.gameId("owner-game");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.InvalidPayout.selector, owner));
+        pool.listGame(id, owner);
+        // Nor may a game wallet move its payout to the owner.
+        vm.prank(dev1);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.InvalidPayout.selector, owner));
+        pool.changePayout(G1, owner);
+        // The pending owner is refused too.
+        vm.prank(owner);
+        pool.transferOwnership(stranger);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.InvalidPayout.selector, stranger));
+        pool.listGame(id, stranger);
+        vm.prank(dev1);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.InvalidPayout.selector, stranger));
+        pool.changePayout(G1, stranger);
+    }
+
+    function test_claim_revertsWhenPayoutBecameOwner() public {
+        // dev1 was listed before becoming owner; a claim to dev1 is refused until the game moves
+        // its payout elsewhere.
+        (bytes32[] memory g, uint256[] memory a) = _three();
+        bytes32[] memory leaves = _propose(M1, g, a);
+        vm.prank(owner);
+        pool.transferOwnership(dev1);
+        vm.prank(dev1);
+        pool.acceptOwnership();
+        skip(3 days);
+        vm.expectRevert(abi.encodeWithSelector(OGClubCreatorPool.InvalidPayout.selector, dev1));
+        pool.claim(M1, G1, a[0], Merkle.proof(leaves, 0));
+        // Other games are unaffected, and dev1's game can claim again once it names another wallet.
+        pool.claim(M1, G2, a[1], Merkle.proof(leaves, 1));
+        address other = makeAddr("dev1-other");
+        vm.prank(dev1);
+        pool.changePayout(G1, other);
+        pool.claim(M1, G1, a[0], Merkle.proof(leaves, 0));
+        assertEq(og.balanceOf(other), a[0]);
+        assertEq(og.balanceOf(dev1), 0, "owner got nothing");
+    }
 
     function test_ownerHasNoWayToTakeTokens() public {
         (bytes32[] memory g, uint256[] memory a) = _three();

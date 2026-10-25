@@ -18,9 +18,15 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// Whatever a month does not pay out is swept back into the free balance once the window closes.
 ///
 /// The owner lists games, proposes and cancels months (only before a month opens) and nothing else:
-/// it can never withdraw, change a game's payout wallet, change the token, or touch money owed to a
-/// month once its three-day delay has passed. $OG only ever leaves this contract as claims to game
+/// it can never withdraw, change a game's payout wallet, change the token, be a payout wallet
+/// itself, or touch money owed to a month once its three-day delay has passed. A month only ever
+/// pays games that were already listed when it was proposed, so the set of wallets a month can pay
+/// is fixed when its public review starts. $OG only ever leaves this contract as claims to game
 /// payout wallets.
+///
+/// Trust assumption: the owner publishes honest Merkle roots and totals. The contract cannot tell a
+/// game wallet the owner secretly controls from any other wallet; the three-day review of the
+/// published list against the listed games is the safeguard against a dishonest root.
 contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -74,12 +80,17 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
 
     /// @notice Listed games by id, where id = keccak256(bytes(kitId)).
     mapping(bytes32 id => Game) public games;
+    /// @notice When a game was listed. A month only pays games listed no later than it was proposed.
+    mapping(bytes32 id => uint64) public listedAt;
     /// @notice Proposed months by id (YYYYMM).
     mapping(uint256 month => Month) public months;
     /// @notice Whether a game has already claimed for a month.
     mapping(uint256 month => mapping(bytes32 game => bool)) public claimed;
-    /// @notice Highest month id ever proposed.
+    /// @notice Highest live (proposed and not cancelled) month id, or 0. Cancelling the last month
+    ///         restores the previous one, so a mistyped id can be undone within its three days.
     uint256 public lastMonth;
+    /// @notice The value of {lastMonth} just before each month was proposed, for {cancelMonth}.
+    mapping(uint256 month => uint256) public lastMonthBefore;
     /// @notice Tokens owed to months that are pending or open. Never exceeds the token balance.
     uint256 public reserved;
 
@@ -101,6 +112,7 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
     error ZeroAmount();
     error GameAlreadyListed(bytes32 id);
     error GameUnknown(bytes32 id);
+    error GameListedAfterProposal(bytes32 id, uint256 month);
     error GameNotListed(bytes32 id);
     error GameAlreadyActive(bytes32 id);
     error NotPayout(bytes32 id, address caller);
@@ -120,6 +132,7 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
     error ExceedsRemaining(uint256 amount, uint256 remaining);
     error NothingToSweep(uint256 month);
     error BalanceMismatch(uint256 expected, uint256 actual);
+    error RenounceDisabled();
 
     // ─────────────────────────────────────────────────────────────────────────────── setup ──
 
@@ -130,6 +143,12 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
         token = token_;
     }
 
+    /// @notice Disabled: without an owner nobody could ever propose a month, so the free balance
+    ///         and every later vault payment would be stuck. Hand over with {transferOwnership}.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────── games ──
 
     /// @notice Game id of a kit id, e.g. gameId("coin-dash").
@@ -138,11 +157,13 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Lists a game with its payout wallet. An id can only ever be listed once; use
-    ///         {delistGame} and {relistGame} afterwards.
+    ///         {delistGame} and {relistGame} afterwards. A game listed after a month was proposed
+    ///         cannot claim from that month, only from months proposed later.
     function listGame(bytes32 id, address payout) external onlyOwner {
         if (games[id].payout != address(0)) revert GameAlreadyListed(id);
         _checkPayout(payout);
         games[id] = Game({payout: payout, listed: true});
+        listedAt[id] = uint64(block.timestamp);
         emit GameListed(id, payout);
     }
 
@@ -195,26 +216,31 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
 
     /// @notice Proposes a month's payout list. Reserves `total` from the free balance; claims open
     ///         after `CLAIM_DELAY`. A month may only be proposed once, unless it was cancelled, in
-    ///         which case proposing it again overwrites it.
+    ///         which case proposing it again overwrites it. The month must be later than
+    ///         {lastMonth}, the highest live month.
     function proposeMonth(uint256 month, bytes32 root, uint256 total) external onlyOwner {
         if (!isValidMonth(month)) revert InvalidMonth(month);
         if (root == bytes32(0)) revert ZeroRoot();
         if (total == 0) revert ZeroAmount();
         uint256 available = free();
         if (total > available) revert InsufficientFree(total, available);
-        if (month < lastMonth || (month == lastMonth && !months[month].cancelled)) {
-            revert MonthNotAfterLast(month, lastMonth);
+        uint256 last = lastMonth;
+        if (month < last || (month == last && !months[month].cancelled)) {
+            revert MonthNotAfterLast(month, last);
         }
 
         uint64 opensAt = uint64(block.timestamp + CLAIM_DELAY);
         months[month] =
             Month({root: root, total: total, remaining: total, opensAt: opensAt, cancelled: false, swept: false});
+        if (month != last) lastMonthBefore[month] = last;
         lastMonth = month;
         reserved += total;
         emit MonthProposed(month, root, total, opensAt);
     }
 
     /// @notice Cancels a month before it opens and releases its reservation back to the free balance.
+    ///         Cancelling the highest month also moves {lastMonth} back to the highest live month, so
+    ///         a mistyped month id does not block the ids below it.
     function cancelMonth(uint256 month) external onlyOwner {
         Month storage m = months[month];
         if (m.opensAt == 0) revert MonthNotProposed(month);
@@ -225,11 +251,21 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
         m.remaining = 0;
         m.cancelled = true;
         reserved -= released;
+        if (month == lastMonth) {
+            // Walk back over months that were cancelled while a later one was still live.
+            uint256 prev = lastMonthBefore[month];
+            while (prev != 0 && months[prev].cancelled) {
+                prev = lastMonthBefore[prev];
+            }
+            lastMonth = prev;
+        }
         emit MonthCancelled(month, released);
     }
 
     /// @notice Pays a game's share of a month to the game's payout wallet. Anyone may call it; the
     ///         caller never receives anything. Once per game per month, within the claim window.
+    ///         The game must have been listed no later than the month was proposed (delisted since
+    ///         is fine), and its payout wallet may not be the owner.
     function claim(uint256 month, bytes32 game, uint256 amount, bytes32[] calldata proof) external nonReentrant {
         Month storage m = months[month];
         if (m.opensAt == 0) revert MonthNotProposed(month);
@@ -241,6 +277,10 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         address payout = games[game].payout;
         if (payout == address(0)) revert GameUnknown(game);
+        // Recipients are fixed when the review starts: a game listed after the proposal waits for
+        // the next month, so the owner cannot pick a leaf's wallet once the month is out of reach.
+        if (listedAt[game] > m.opensAt - CLAIM_DELAY) revert GameListedAfterProposal(game, month);
+        if (payout == owner()) revert InvalidPayout(payout);
         if (!MerkleProof.verifyCalldata(proof, m.root, leaf(month, game, amount))) revert InvalidProof();
         if (amount > m.remaining) revert ExceedsRemaining(amount, m.remaining);
 
@@ -248,10 +288,13 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
         m.remaining -= amount;
         reserved -= amount;
 
-        uint256 before = token.balanceOf(address(this));
+        uint256 poolBefore = token.balanceOf(address(this));
+        uint256 payoutBefore = token.balanceOf(payout);
         token.safeTransfer(payout, amount);
-        uint256 sent = before - token.balanceOf(address(this));
+        uint256 sent = poolBefore - token.balanceOf(address(this));
         if (sent != amount) revert BalanceMismatch(amount, sent);
+        uint256 received = token.balanceOf(payout) - payoutBefore;
+        if (received != amount) revert BalanceMismatch(amount, received);
         emit Claimed(month, game, payout, amount, msg.sender);
     }
 
@@ -311,8 +354,10 @@ contract OGClubCreatorPool is Ownable2Step, ReentrancyGuard {
         if (game.payout == address(0)) revert GameUnknown(id);
     }
 
+    /// @dev A payout wallet may not be zero, the pool, the owner or the pending owner. {claim}
+    ///      re-checks the owner, since ownership can move after a game is listed.
     function _checkPayout(address payout) private view {
         if (payout == address(0)) revert ZeroAddress();
-        if (payout == address(this)) revert InvalidPayout(payout);
+        if (payout == address(this) || payout == owner() || payout == pendingOwner()) revert InvalidPayout(payout);
     }
 }

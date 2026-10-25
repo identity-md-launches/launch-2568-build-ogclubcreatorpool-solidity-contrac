@@ -5,8 +5,10 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @notice ERC-20 that burns 1% on every transfer. Used to prove the pool's exact balance checks.
 ///         With `chargeSender == false` the recipient receives 1% less than sent (the usual
-///         fee-on-transfer shape, caught by {OGClubCreatorPool.fund}). With `chargeSender == true`
-///         the sender is debited 1% more than the amount (caught by {OGClubCreatorPool.claim}).
+///         fee-on-transfer shape, caught by {OGClubCreatorPool.fund} on the pool's side and by
+///         {OGClubCreatorPool.claim} on the recipient's side). With `chargeSender == true` the
+///         sender is debited 1% more than the amount (caught by {OGClubCreatorPool.claim} on the
+///         pool's side).
 contract FeeOnTransferToken is ERC20 {
     uint256 public constant FEE_BPS = 100;
     bool public immutable chargeSender;
