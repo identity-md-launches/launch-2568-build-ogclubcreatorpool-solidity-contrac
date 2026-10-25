@@ -1,0 +1,5 @@
+out/
+cache/
+broadcast/
+test/scratch/
+lib/openzeppelin-contracts/.gitmodules

@@ -1,0 +1,5 @@
+[
+  {"kitId": "coin-dash", "payout": "<payout wallet of the coin-dash developer>"},
+  {"kitId": "rocket-run", "payout": "<payout wallet of the rocket-run developer>"},
+  {"kitId": "puzzle-pit", "payout": "<payout wallet of the puzzle-pit developer>"}
+]
