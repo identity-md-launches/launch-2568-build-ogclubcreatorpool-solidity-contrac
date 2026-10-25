@@ -1,0 +1,13 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "OGClubCreatorPool",
+      "constructorArgs": [
+        "0xCe7EB1Ad9e2E1c784ea05F7eA4A0Fe625923D10A",
+        "$owner"
+      ]
+    }
+  ],
+  "notes": "OGClubCreatorPool pays $OG each month to the payout wallets of games listed in OG Club World. constructor(IERC20 token, address owner): token is the live Ethereum mainnet $OG ERC-20 at 0xCe7EB1Ad9e2E1c784ea05F7eA4A0Fe625923D10A (symbol OG, 18 decimals, 1,000,000,000 supply; the token() of the live OG Club farm vault 0x60401e748d6c3a1f2775bE9e6a41bda20eDa0B80 and the OG argument of the accepted OGClubHookDeployer launch for the same owner). The brief left the address to env OG_TOKEN and nobody can answer a question, so the manifest step fixed it from those prior launches and verified it on chain; the token is immutable and the constructor never calls it, so deployment on an empty chain succeeds. owner is $owner (Ownable2Step, two-step handover). The owner can list, delist and relist games, propose a month (Merkle root + total <= free(), opens after 3 days, claims for 90 days) and cancel a month only before it opens. The owner cannot withdraw, sweep to itself, change a game's payout wallet (only the current wallet can), change the token, or touch a month's money once its 3-day delay has passed. $OG only leaves as claims to games' payout wallets; sweep returns unclaimed to free() inside the pool. Money arrives by plain ERC-20 transfer (farm vault season claims naming the pool as an account) or fund(amount). No ETH, no receive, no proxy, no delegatecall, no selfdestruct. Deploys nothing else: no token, pool or initialization call. After launch the owner lists games with listGame(gameId(kitId), payoutWallet) and adds the pool's address to vault seasons (out of scope)."
+}
